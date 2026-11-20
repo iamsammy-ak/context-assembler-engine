@@ -1,0 +1,123 @@
+# Example spec: an on-call incident assistant. All services, alerts and runbooks are invented.
+# Try:  ctxasm explain examples/incident_assistant.yaml
+#       ctxasm assemble examples/incident_assistant.yaml --budget 900 -o prompt.json
+title: On-call incident assistant (fictional)
+budget:
+  context_window: 1024
+  output_reserve: 256
+
+system: >-
+  You are the on-call assistant for the payments platform team. Help the engineer diagnose the
+  incident using the runbook extracts, recent alerts and the tools provided. Prefer reversible actions
+  and say which evidence supports each suggestion.
+
+instructions:
+  - id: evidence
+    text: Name the runbook extract or alert that supports every diagnosis, using its id in brackets.
+    required: true
+  - id: no-prod-writes
+    text: Never run a tool that changes production without the engineer typing "approve".
+    required: true
+  - id: brevity
+    text: Use short numbered steps.
+    score: 0.4
+
+tools:
+  - name: query_metrics
+    description: Run a PromQL query over the last N minutes and return the series as a compact table.
+    parameters:
+      type: object
+      properties:
+        promql: {type: string, description: "PromQL expression.", examples: ["rate(http_requests_total{code=~'5..'}[5m])"]}
+        minutes: {type: integer, minimum: 1, maximum: 1440, default: 30, description: "Look-back window."}
+      required: [promql]
+  - name: search_logs
+    description: Search service logs for a phrase and return the newest matching lines with timestamps.
+    parameters:
+      type: object
+      properties:
+        service: {type: string, description: "Service name, e.g. payments-api."}
+        phrase: {type: string, description: "Text to search for."}
+        limit: {type: integer, default: 50, description: "Maximum lines."}
+      required: [service, phrase]
+  - name: rollback_deploy
+    description: Roll a service back to its previous release. Changes production; needs explicit approval.
+    parameters:
+      type: object
+      properties:
+        service: {type: string, description: "Service to roll back."}
+        reason: {type: string, description: "Why, for the audit log."}
+      required: [service, reason]
+  - name: scale_deployment
+    description: Change the replica count of a deployment. Changes production; needs explicit approval.
+    parameters:
+      type: object
+      properties:
+        service: {type: string}
+        replicas: {type: integer, minimum: 1, maximum: 50}
+      required: [service, replicas]
+  - name: page_team
+    description: Page another team's on-call engineer with a short summary of the incident.
+    parameters:
+      type: object
+      properties:
+        team: {type: string, enum: [database, network, identity, payments]}
+        summary: {type: string}
+      required: [team, summary]
+
+memory:
+  - id: mem-deploy
+    text: payments-api release 2026.11.19-2 went out at 09:42 UTC today.
+    score: 0.9
+  - id: mem-db-maint
+    text: The database team scheduled connection-pool maintenance for 10:00-10:30 UTC today.
+    score: 0.8
+  - id: mem-flaky-alert
+    text: The card-tokeniser latency alert is known to be noisy on Mondays.
+    score: 0.3
+
+retrieved:
+  - id: rb-5xx#2
+    score: 0.92
+    text: >-
+      Elevated 5xx on payments-api. First compare the error start time with the latest deploy and with
+      dependency incidents. If errors began within 15 minutes of a deploy and the logs show new
+      exception types, roll back. If errors are timeouts to the database, check connection-pool
+      saturation before rolling back.
+  - id: rb-db-pool#1
+    score: 0.81
+    text: >-
+      Connection-pool saturation shows as rising "pool exhausted" log lines and p99 latency above two
+      seconds. During planned maintenance the pool size is halved; scaling the API up makes it worse
+      because every replica opens more connections.
+  - id: rb-5xx#2-copy
+    score: 0.9
+    text: >-
+      Elevated 5xx on payments-api. First compare the error start time with the latest deploy and with
+      dependency incidents. If errors began within 15 minutes of a deploy and the logs show new
+      exception types, roll back.
+  - id: rb-rollback#4
+    score: 0.66
+    text: >-
+      Rollbacks take about four minutes and are safe for payments-api because schema changes ship
+      separately. Announce the rollback in the incident channel first.
+  - id: rb-paging#1
+    score: 0.4
+    text: Page the owning team when the root cause is in their dependency; include graphs, not screenshots.
+
+history:
+  - role: user
+    content: We have a 5xx spike on payments-api since about 10:02 UTC, around 4% of requests.
+  - role: assistant
+    content: >-
+      Thanks. Two recent changes stand out: the 09:42 release and the database maintenance at 10:00.
+      Can you check whether the errors are timeouts or new exceptions?
+  - role: user
+    content: Logs show "pool exhausted" warnings and DB timeouts, no new exception types.
+  - role: assistant
+    content: That points at the connection pool rather than the release. What does p99 latency look like?
+  - role: user
+    content: p99 jumped to about 2.4 seconds at 10:01.
+    pinned: true
+
+query: Should I roll back the 09:42 release or scale up payments-api to get through the maintenance?

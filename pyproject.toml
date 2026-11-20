@@ -1,0 +1,79 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "context-assembler-engine"
+version = "0.1.0"
+description = "Assemble LLM prompts from many sources under a hard, verified token budget."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Abhishek Kumar" }]
+keywords = ["llm", "context-window", "token-budget", "prompt-engineering", "rag", "tiktoken"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+dependencies = [
+    "pydantic>=2.6",
+    "tiktoken>=0.7",
+    "typer>=0.15",
+    "rich>=13.7",
+    "pyyaml>=6.0",
+    "openai>=1.30",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+bench = ["matplotlib>=3.7"]
+dev = [
+    "pytest>=8.0",
+    "hypothesis>=6.100",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "matplotlib>=3.7",
+]
+
+[project.scripts]
+ctxasm = "context_assembler.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/iamsammy-ak/context-assembler-engine"
+Issues = "https://github.com/iamsammy-ak/context-assembler-engine/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/context_assembler"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# Typer reads option defaults from function signatures.
+"src/context_assembler/cli.py" = ["B008"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = [
+    "models: needs the tiktoken encoding files (downloaded on first use, cached afterwards)",
+]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src"]
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true

@@ -1,0 +1,520 @@
+# Demo scenario: a customer-support copilot for a fictional invoicing product ("Lumen Ledger").
+# Every company, person, number and help-centre article below is invented for the demo.
+title: Billing-support copilot (fictional)
+model: generic-8k
+
+system: >-
+  You are Ledger Assist, the customer-support copilot for Lumen Ledger, a subscription invoicing
+  platform for small agencies. You answer billing and account questions using the help-centre
+  extracts, the customer's account memory and the tools provided. Be exact about amounts, dates and
+  policy, and say so when you are not sure.
+
+instructions:
+  - id: cite-sources
+    text: Cite help-centre extracts by their id in square brackets, for example [kb-refunds#2].
+    required: true
+  - id: confirm-writes
+    text: >-
+      Before calling a tool that changes billing data (refunds, credit notes, plan or billing-detail
+      changes), restate the exact action and wait for the customer's explicit confirmation.
+    required: true
+  - id: refund-limit
+    text: Refunds above EUR 500 need billing-team approval, so escalate them instead of refunding.
+    score: 0.9
+  - id: privacy
+    text: Never reveal full card or bank numbers; refer to the last four digits only.
+    score: 0.7
+  - id: tone
+    text: Be warm and concise, at most 150 words unless the customer asks for more detail.
+    score: 0.5
+
+tools:
+  - name: get_customer
+    description: >-
+      Look up a customer account by workspace id. Returns the legal name, plan, billing currency,
+      billing address, VAT number and contacts. Use this before any billing change to confirm the account.
+    parameters:
+      type: object
+      properties:
+        workspace_id: {type: string, description: "Workspace id, e.g. ws_48213.", examples: ["ws_48213"]}
+      required: [workspace_id]
+  - name: list_invoices
+    description: >-
+      List a customer's invoices, newest first, with number, date, amount, status and the payment
+      attempts behind each one. Filter by status to find unpaid or refunded invoices.
+    parameters:
+      type: object
+      properties:
+        workspace_id: {type: string, description: "Workspace id of the customer."}
+        status: {type: string, enum: [any, paid, open, refunded, void], default: any, description: "Invoice status filter."}
+        limit: {type: integer, minimum: 1, maximum: 50, default: 10, description: "Maximum invoices to return."}
+      required: [workspace_id]
+  - name: get_invoice
+    description: >-
+      Fetch one invoice with its line items, tax breakdown, payment attempts and the event that
+      created it (subscription change, retry, manual). Use it to explain a charge.
+    parameters:
+      type: object
+      properties:
+        invoice_id: {type: string, description: "Invoice number, e.g. INV-2304.", examples: ["INV-2304"]}
+      required: [invoice_id]
+  - name: issue_refund
+    description: >-
+      Refund all or part of a paid invoice to the original payment method. Refunds of duplicate
+      charges are always full. Agents may refund up to EUR 500 without approval. Only call this after
+      the customer has confirmed the invoice, the amount and the refund destination.
+    parameters:
+      type: object
+      properties:
+        invoice_id: {type: string, description: "Invoice to refund, e.g. INV-2304.", examples: ["INV-2304"]}
+        amount: {type: number, exclusiveMinimum: 0, description: "Amount to refund in the invoice currency."}
+        currency: {type: string, enum: [EUR, GBP, USD], description: "Invoice currency."}
+        reason: {type: string, enum: [duplicate, service_issue, goodwill, other], description: "Refund reason for reporting."}
+        note: {type: string, description: "Internal note shown to the billing team.", examples: ["Duplicate retry charge"]}
+      required: [invoice_id, amount, currency, reason]
+  - name: create_credit_note
+    description: >-
+      Issue a credit note against an invoice instead of a cash refund. The credit is applied to the
+      customer's next invoices. Use it when the customer prefers account credit.
+    parameters:
+      type: object
+      properties:
+        invoice_id: {type: string, description: "Invoice the credit note corrects."}
+        amount: {type: number, exclusiveMinimum: 0, description: "Credit amount in the invoice currency."}
+        reason: {type: string, description: "Reason printed on the credit note."}
+      required: [invoice_id, amount, reason]
+  - name: update_billing_details
+    description: >-
+      Change the legal name, billing address or VAT number on a customer's billing profile. Changes
+      apply to new invoices; regenerate past invoices separately.
+    parameters:
+      type: object
+      properties:
+        workspace_id: {type: string, description: "Workspace id of the customer."}
+        legal_name: {type: string, description: "Registered company name printed on invoices."}
+        vat_number: {type: string, description: "EU VAT number including the country prefix.", examples: ["NL859245613B01"]}
+        address:
+          type: object
+          description: Billing address.
+          properties:
+            line1: {type: string, description: "Street and number."}
+            city: {type: string, description: "City."}
+            postcode: {type: string, description: "Postal code."}
+            country: {type: string, description: "ISO 3166-1 alpha-2 country code.", examples: ["NL"]}
+      required: [workspace_id]
+  - name: regenerate_invoice
+    description: >-
+      Re-issue an existing invoice using the current billing profile (legal name, address, VAT
+      number). The invoice number stays the same, the PDF is replaced and accounting integrations are
+      updated. Allowed for invoices issued in the last 12 months.
+    parameters:
+      type: object
+      properties:
+        invoice_id: {type: string, description: "Invoice to regenerate."}
+        send_copy: {type: boolean, default: true, description: "Email the new PDF to the billing contact."}
+      required: [invoice_id]
+  - name: retry_payment
+    description: >-
+      Retry collection of an open invoice immediately using the default payment method. Do not use it
+      on paid invoices.
+    parameters:
+      type: object
+      properties:
+        invoice_id: {type: string, description: "Open invoice to collect."}
+      required: [invoice_id]
+  - name: change_plan
+    description: >-
+      Move a subscription to another plan. Upgrades take effect immediately with a prorated charge;
+      downgrades take effect at the end of the billing period.
+    parameters:
+      type: object
+      properties:
+        workspace_id: {type: string, description: "Workspace id of the customer."}
+        plan: {type: string, enum: [starter, growth, scale, enterprise], description: "Target plan."}
+        seats: {type: integer, minimum: 1, description: "Number of paid seats after the change."}
+      required: [workspace_id, plan]
+  - name: cancel_subscription
+    description: >-
+      Cancel a subscription, either at the end of the current billing period or immediately with a
+      prorated credit. Requires the cancellation reason for churn reporting.
+    parameters:
+      type: object
+      properties:
+        workspace_id: {type: string, description: "Workspace id of the customer."}
+        at_period_end: {type: boolean, default: true, description: "Cancel when the paid period ends."}
+        reason: {type: string, description: "Why the customer is cancelling."}
+      required: [workspace_id, reason]
+  - name: search_help_center
+    description: >-
+      Search the public help centre and return the most relevant article extracts with their ids, for
+      questions not covered by the extracts already provided.
+    parameters:
+      type: object
+      properties:
+        query: {type: string, description: "Search query in plain words."}
+        limit: {type: integer, minimum: 1, maximum: 10, default: 5, description: "Number of extracts."}
+      required: [query]
+  - name: escalate_to_billing_team
+    description: >-
+      Hand a case to the human billing team, for example refunds above the agent limit, disputes or
+      chargebacks. The team replies to the customer by email within one business day.
+    parameters:
+      type: object
+      properties:
+        summary: {type: string, description: "What happened and what the customer wants."}
+        priority: {type: string, enum: [low, normal, high], default: normal, description: "Urgency."}
+        invoice_ids: {type: array, items: {type: string}, description: "Invoices involved."}
+      required: [summary]
+  - name: send_customer_email
+    description: >-
+      Email the customer's billing contact, for example to confirm an action or share a document.
+      Use a short subject and plain text.
+    parameters:
+      type: object
+      properties:
+        subject: {type: string, description: "Email subject."}
+        body: {type: string, description: "Plain-text email body."}
+      required: [subject, body]
+  - name: get_payment_methods
+    description: >-
+      List the stored payment methods for a workspace with brand, last four digits, expiry date and
+      which one is the default. Full card numbers are never returned.
+    parameters:
+      type: object
+      properties:
+        workspace_id: {type: string, description: "Workspace id of the customer."}
+      required: [workspace_id]
+  - name: add_billing_contact
+    description: >-
+      Add an email address to the workspace's billing contacts so it receives invoices, receipts and
+      refund confirmations. Billing contacts do not use a seat.
+    parameters:
+      type: object
+      properties:
+        workspace_id: {type: string, description: "Workspace id of the customer."}
+        email: {type: string, format: email, description: "Address to add.", examples: ["accounts@example.com"]}
+        name: {type: string, description: "Contact name shown on emails."}
+      required: [workspace_id, email]
+  - name: export_time_report
+    description: >-
+      Export the hours-by-client report for a month as CSV or PDF and return a download link valid
+      for 24 hours.
+    parameters:
+      type: object
+      properties:
+        workspace_id: {type: string, description: "Workspace id of the customer."}
+        month: {type: string, pattern: "^[0-9]{4}-[0-9]{2}$", description: "Month as YYYY-MM.", examples: ["2026-10"]}
+        format: {type: string, enum: [csv, pdf], default: csv, description: "File format."}
+      required: [workspace_id, month]
+  - name: apply_coupon
+    description: >-
+      Apply a promotional coupon code to a subscription. Coupons affect future invoices only and cannot
+      be combined with each other.
+    parameters:
+      type: object
+      properties:
+        workspace_id: {type: string, description: "Workspace id of the customer."}
+        code: {type: string, description: "Coupon code exactly as issued."}
+      required: [workspace_id, code]
+
+memory:
+  - id: mem-account
+    text: Customer is Halden Studio, a 14-person design agency in Rotterdam, workspace ws_48213.
+    score: 0.9
+  - id: mem-contact
+    text: Primary contact is Priya Natarajan, finance lead, who prefers email updates over phone calls.
+    score: 0.8
+  - id: mem-contact-copy
+    text: Primary contact is Priya Natarajan, finance lead, who prefers email updates over phone calls today.
+    score: 0.6
+  - id: mem-plan
+    text: On the Growth plan, billed annually in EUR since March 2025.
+    score: 0.85
+  - id: mem-upgrade
+    text: Upgraded from Starter to Growth on 4 November 2026, in the middle of the billing year.
+    score: 0.9
+  - id: mem-card
+    text: Default payment method is a Visa ending 4417; a SEPA mandate ending 2291 is the backup.
+    score: 0.8
+  - id: mem-legal-name
+    text: Invoices must be addressed to the legal entity Halden Studio B.V., not the trading name.
+    score: 0.7
+  - id: mem-goodwill
+    text: A EUR 40 goodwill credit was applied in June 2026 after a failed card retry.
+    score: 0.55
+  - id: mem-month-end
+    text: The agency closes its books on the fifth working day of each month.
+    score: 0.5
+  - id: mem-sso
+    text: Asked about the Enterprise plan for single sign-on in 2025; did not pursue it.
+    score: 0.25
+  - id: mem-integrations
+    text: The workspace has three integrations connected, Xero, Slack and HubSpot.
+    score: 0.3
+  - id: mem-portal
+    text: Designers use the client portal heavily; branding was customised in September.
+    score: 0.35
+
+retrieved:
+  - id: kb-double-charges#1
+    score: 0.91
+    text: >-
+      Why was I charged twice? A second charge for the same amount usually comes from a payment retry.
+      When a card payment is declined, Lumen Ledger retries it automatically after a short delay. If the
+      bank later approves the first attempt as well, the retry can create a second paid invoice for the
+      same subscription change. You will then see two invoices with different numbers but the same
+      amount and description. These duplicates are always refunded in full to the original payment
+      method, and the duplicate invoice is voided so that it no longer appears in your accounting
+      integration. Support can confirm a duplicate by comparing the payment attempts on both invoices:
+      a duplicate has the same card, the same amount and a retry flag on the second attempt.
+  - id: kb-double-charges#1-mirror
+    score: 0.9
+    text: >-
+      Why was I charged twice? A second charge for the same amount usually comes from a payment retry.
+      When a card payment is declined, Lumen Ledger retries it automatically after a short delay. If the
+      bank later approves the first attempt as well, the retry can create a second paid invoice for the
+      same subscription change. You will then see two invoices with different numbers but the same
+      amount and description. These duplicates are always refunded in full to the original payment
+      method, and the duplicate invoice is voided so that it no longer appears in your accounting
+      integration.
+  - id: kb-refunds#2
+    score: 0.88
+    text: >-
+      Refund policy. Duplicate charges and charges made after a cancellation date are refunded in full,
+      with no questions asked. Refunds always go back to the original payment method; we cannot send
+      money to a different card or bank account. Customers who would rather keep the money on their
+      account can receive a credit note instead, which is applied to future invoices. Support agents can
+      issue refunds of up to EUR 500 per invoice themselves; larger refunds are reviewed and approved by
+      the billing team within one business day. Partial refunds are not available for downgrades or
+      seat reductions, because those take effect at the end of the billing period rather than
+      immediately.
+  - id: kb-refunds-archive#2
+    score: 0.86
+    text: >-
+      Refund policy. Duplicate charges and charges made after a cancellation date are refunded in full,
+      with no questions asked. Refunds always go back to the original payment method; we cannot send
+      money to a different card or bank account. Customers who would rather keep the money on their
+      account can receive a credit note instead, which is applied to future invoices. Support agents can
+      issue refunds of up to EUR 500 per invoice themselves; larger refunds are reviewed and approved by
+      the billing team within one business day.
+  - id: kb-vat-invoices#1
+    score: 0.84
+    text: >-
+      Adding a VAT number. Business customers in the EU can add their VAT number under Settings,
+      Billing, Tax details. Lumen Ledger validates the number against the EU VIES service before saving
+      it, so make sure the country prefix is included. From then on, new invoices apply the
+      reverse-charge mechanism and show your VAT number together with the text "VAT reverse charged".
+      Invoices issued in the last 12 months can be regenerated on request using the new details; the
+      invoice number and date do not change, only the customer details and the tax lines. Invoices
+      older than 12 months cannot be changed because they have already been reported.
+  - id: kb-reverse-charge#2
+    score: 0.62
+    text: >-
+      Reverse charge explained. Lumen Ledger is registered for VAT in Ireland. For business customers in
+      other EU countries with a valid VAT number, we do not charge VAT; instead the customer accounts for
+      it in their own VAT return. Without a valid VAT number we must charge Irish VAT at the standard
+      rate. If VAT was charged before you added your number, regenerating the invoice removes the VAT
+      line and the difference is returned as a credit note, not as a card refund.
+  - id: kb-proration#1
+    score: 0.79
+    text: >-
+      How proration works. When you upgrade in the middle of a billing period, you pay only for the
+      remaining time on the new plan, minus the unused time on your old plan. The prorated amount is
+      charged immediately on a separate invoice, so your next renewal invoice is unchanged. Annual plans
+      are prorated by day and monthly plans by second. Adding seats works the same way unless you choose
+      to add them to your next invoice instead. Removing seats is never prorated: the reduction applies
+      from the next renewal.
+  - id: kb-refund-timelines#1
+    score: 0.74
+    text: >-
+      How long do refunds take? Card refunds are sent to your bank immediately, but banks usually take
+      5 to 10 business days to show them on a statement, and some business cards take longer at
+      month-end. SEPA Direct Debit refunds take 3 to 5 business days. You receive an email with a refund
+      reference as soon as the refund is issued; quote that reference if you contact your bank. If the
+      refund has not arrived after 10 business days, contact support with the reference and we will
+      ask the payment processor for a trace.
+  - id: kb-credit-notes#1
+    score: 0.72
+    text: >-
+      Credit notes versus refunds. A credit note reduces what you owe on future invoices instead of
+      returning money to your card. Credit notes never expire while your subscription is active and are
+      applied automatically to the next invoice, before any payment is taken. They appear in your
+      accounting integration as a separate document linked to the original invoice. If you cancel your
+      subscription, unused credit is refunded on request.
+  - id: kb-failed-payments#3
+    score: 0.66
+    text: >-
+      Failed payments. If a payment fails, we retry after 1, 3 and 5 days and email the billing contact
+      each time. You can update your card at any time and retry immediately from the Billing page. In
+      rare cases a bank approves a payment late, after a retry has already succeeded; this is the main
+      cause of duplicate charges and is refunded in full. After the last failed retry the workspace
+      switches to read-only until the invoice is paid.
+  - id: kb-invoice-pdf#1
+    score: 0.63
+    text: >-
+      Regenerating invoice PDFs. If your company name, address or VAT number was wrong, update your
+      billing profile first and then ask support to regenerate the affected invoices. The new PDF
+      replaces the old one, keeps the same invoice number and is emailed to your billing contacts.
+      Connected accounting tools receive the updated invoice automatically, so there is nothing to
+      delete by hand.
+  - id: kb-payment-methods#2
+    score: 0.58
+    text: >-
+      Payment methods. Lumen Ledger accepts Visa, Mastercard and American Express cards, and SEPA Direct
+      Debit for EUR accounts. You can store one default and one backup method. The backup is used
+      automatically if the default fails twice in a row. Card details are stored by our payment
+      processor; support can only see the brand, the expiry date and the last four digits.
+  - id: kb-billing-contacts#1
+    score: 0.55
+    text: >-
+      Billing contacts. Invoices, receipts and refund confirmations are emailed to every billing contact
+      on the workspace. Owners can add up to five billing contacts under Settings, Billing, Contacts, for
+      example an external accountant. Billing contacts do not need a seat and cannot see client work.
+  - id: kb-plan-changes#4
+    score: 0.51
+    text: >-
+      Changing plans. Upgrades are immediate and prorated. Downgrades are scheduled for the end of the
+      current billing period, so you keep the features you paid for until then. Seat reductions follow
+      the same rule. You can cancel a scheduled downgrade at any time before it takes effect.
+  - id: kb-currency#1
+    score: 0.44
+    text: >-
+      Billing currency. The currency is set when you first subscribe and cannot be changed during a
+      subscription. To switch currency, cancel at the end of the period and start a new subscription in
+      the new currency; your data stays in place.
+  - id: kb-cancellation#2
+    score: 0.39
+    text: >-
+      Cancelling. You can cancel at any time from the Billing page. Cancellation takes effect at the end
+      of the paid period and the workspace stays fully usable until then. Charges made after a
+      cancellation date are refunded in full.
+  - id: kb-xero-sync#1
+    score: 0.35
+    text: >-
+      Xero sync. Finalised invoices, credit notes and refunds are pushed to Xero within a few minutes.
+      Regenerated invoices replace the earlier version in Xero, and voided invoices are marked as voided
+      there too. If the sync fails, the Integrations page shows the error and a retry button.
+  - id: kb-sso#1
+    score: 0.22
+    text: >-
+      Single sign-on. SAML single sign-on with Okta, Microsoft Entra ID and Google Workspace is available
+      on the Enterprise plan. Contact sales to enable it for your workspace.
+
+history:
+  - role: user
+    content: Hi, this is Priya from Halden Studio. Something looks wrong with our billing this month.
+  - role: assistant
+    content: Hi Priya, happy to help. Which invoice or charge looks wrong to you?
+  - role: user
+    content: >-
+      We upgraded to Growth on the 4th and since then there are two charges of EUR 249 on our Visa,
+      two days apart. We only expected one.
+  - role: assistant
+    content: >-
+      Thanks. I can see invoice INV-2291 for EUR 249 on 4 November, which is the prorated upgrade
+      charge, and INV-2304 for EUR 249 on 6 November. Let me check what created INV-2304.
+  - role: user
+    content: >-
+      Also, our accountant noticed that neither invoice shows our VAT number, so she cannot reclaim
+      the VAT on them.
+  - role: assistant
+    content: >-
+      Understood, that is a separate fix. Once your VAT number is on your billing profile, the
+      invoices can be reissued to include it. Do you have the number to hand?
+  - role: user
+    content: Not right now, I will dig it out. Back to the charges, was the second one a mistake?
+  - role: assistant
+    content: >-
+      INV-2304 was created by an automatic payment retry after your card was briefly declined on the
+      4th, even though the first payment went through in the end. So yes, it is a duplicate charge for
+      the same upgrade.
+  - role: user
+    content: That is frustrating. We are a small agency and EUR 249 matters to us.
+  - role: assistant
+    content: >-
+      I understand, and I am sorry about the trouble. A duplicate charge qualifies for a full refund.
+      Do you want it back on the original Visa, or as credit on your account?
+  - role: user
+    content: Hold on, let me check with our managing director how she wants it handled.
+  - role: assistant
+    content: Of course, take your time.
+  - role: user
+    content: While I wait, does the Growth plan include the client portal? Our designers asked.
+  - role: assistant
+    content: >-
+      Yes. Growth includes the client portal with custom branding and up to 50 client logins, so your
+      current setup is covered.
+  - role: user
+    content: >-
+      Great. Our designers also want to export a monthly report of hours per client. Is that something
+      the Growth plan can do, or do we need a different plan for it?
+  - role: assistant
+    content: >-
+      Growth includes the time-report export. Under Reports, choose Hours by client, pick the month and
+      export it as CSV or PDF. Scheduled monthly exports by email are part of the Scale plan.
+  - role: user
+    content: Fine, we can run it by hand. Could we add two more seats this month without another surprise charge?
+  - role: assistant
+    content: >-
+      Adding seats creates a prorated charge for the rest of your billing year. You can pay it now or
+      have it added to your next invoice instead, which avoids a separate charge.
+  - role: user
+    content: Let us leave the seats for now. Are invoices synced to Xero automatically?
+  - role: assistant
+    content: >-
+      Yes. Your Xero integration receives each invoice when it is finalised, and a regenerated invoice
+      replaces the earlier version there.
+  - role: user
+    content: >-
+      Our external accountant, Marco, should get invoice emails too. At the moment only I receive them
+      and I keep forwarding them to him.
+  - role: assistant
+    content: >-
+      You can add Marco as a billing contact under Settings, Billing, Contacts. He will receive invoices
+      and refund confirmations without needing a seat. Would you like me to walk you through it?
+  - role: user
+    content: No need, I will do it later today. Our MD says refund the duplicate to the card, not as credit.
+  - role: assistant
+    content: >-
+      Noted: the refund goes back to the Visa ending 4417. I will confirm the amount and the invoice
+      with you before processing anything.
+  - role: user
+    content: >-
+      Found the VAT number, it is NL859245613B01. Please make sure the corrected invoices are addressed
+      to Halden Studio B.V.
+  - role: assistant
+    content: >-
+      Thank you. I have the VAT number NL859245613B01 and the legal name Halden Studio B.V. I can
+      update your billing details and regenerate INV-2291 once you confirm.
+  - role: user
+    content: One more thing, will the refund show up before our month-end close?
+  - role: assistant
+    content: >-
+      It depends on your bank. I will give you the expected timing when I confirm the refund, and you
+      will get an email with the refund reference.
+
+few_shot:
+  - id: ex-refund-after-cancel
+    score: 0.8
+    user: I cancelled last month but was charged again. Can I get that back?
+    assistant: >-
+      I am sorry about that. Charges made after a cancellation are refunded in full [kb-cancellation#2].
+      I can see INV-1187 for EUR 49 dated after your cancellation. Shall I refund it to your original
+      card? Card refunds usually show within 5 to 10 business days [kb-refund-timelines#1].
+  - id: ex-vat-old-invoices
+    score: 0.7
+    user: Can you add our VAT number to last year's invoices?
+    assistant: >-
+      Yes for invoices from the last 12 months [kb-vat-invoices#1]. First I will add the VAT number to
+      your billing profile, then regenerate the invoices; their numbers stay the same. Which invoices
+      do you need, and can you confirm the VAT number?
+  - id: ex-price-increase
+    score: 0.4
+    user: Why is this invoice higher than usual?
+    assistant: >-
+      Your invoice includes a prorated charge for two seats added on 12 March [kb-proration#1]. You
+      pay only for the remaining days of your billing year. Would you like a breakdown by line item?
+
+query: >-
+  Yes, please go ahead: refund the duplicate EUR 249 charge on INV-2304 to our Visa, and send us the
+  corrected invoice with our VAT number. Roughly how long will the refund take to arrive?

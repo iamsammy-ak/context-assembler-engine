@@ -1,0 +1,15 @@
+# Register your own model profiles. Use the figures from your provider's documentation; the
+# names and numbers below are placeholders, not real vendor limits.
+# Try:  ctxasm models --models-file examples/custom_models.yaml
+#       ctxasm explain examples/incident_assistant.yaml --model team-small --models-file examples/custom_models.yaml
+models:
+  - name: team-small
+    context_window: 1536
+    output_reserve: 384
+    encoding: o200k_base
+    notes: Placeholder profile for a small self-hosted model.
+  - name: team-legacy
+    context_window: 4096
+    output_reserve: 1024
+    encoding: cl100k_base
+    notes: Placeholder profile for an older model that uses cl100k_base.
